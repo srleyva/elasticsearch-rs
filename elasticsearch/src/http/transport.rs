@@ -34,19 +34,21 @@ use crate::{
         response::Response,
         Method,
     },
+    nodes::{NodesInfo, NodesInfoParts},
 };
 use base64::write::EncoderWriter as Base64Encoder;
 use bytes::BytesMut;
 use serde::Serialize;
+use serde_json::Value;
 use std::{
     error, fmt,
     fmt::Debug,
     io::{self, Write},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, RwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use url::Url;
 
@@ -353,6 +355,22 @@ impl Transport {
         Ok(transport)
     }
 
+    pub fn sniff_node_pool(urls: Vec<&str>) -> Result<Transport, Error> {
+        let urls: Vec<Url> = urls
+            .iter()
+            .map(|url| Url::parse(url))
+            .collect::<Result<Vec<_>, _>>()?;
+        let bootstrap_conn_pool = StaticNodeListConnectionPool::round_robin(urls);
+        let bootstrap_transport = TransportBuilder::new(bootstrap_conn_pool.clone()).build()?;
+        let conn_pool = SniffConnectionPool::round_robin(
+            bootstrap_transport,
+            Duration::from_secs(80),
+            bootstrap_conn_pool,
+        );
+        let transport = TransportBuilder::new(conn_pool).build()?;
+        Ok(transport)
+    }
+
     /// Creates a new instance of a [Transport] configured for use with
     /// [Elasticsearch service in Elastic Cloud](https://www.elastic.co/cloud/).
     ///
@@ -461,7 +479,7 @@ impl Default for Transport {
 /// dynamically at runtime, based upon the response to API calls.
 pub trait ConnectionPool: Debug + dyn_clone::DynClone + Sync + Send {
     /// Gets a reference to the next [Connection]
-    fn next(&self) -> &Connection;
+    fn next(&self) -> Connection;
 }
 
 clone_trait_object!(ConnectionPool);
@@ -490,8 +508,8 @@ impl Default for SingleNodeConnectionPool {
 
 impl ConnectionPool for SingleNodeConnectionPool {
     /// Gets a reference to the next [Connection]
-    fn next(&self) -> &Connection {
-        &self.connection
+    fn next(&self) -> Connection {
+        self.connection.clone()
     }
 }
 
@@ -611,8 +629,8 @@ impl CloudConnectionPool {
 
 impl ConnectionPool for CloudConnectionPool {
     /// Gets a reference to the next [Connection]
-    fn next(&self) -> &Connection {
-        &self.connection
+    fn next(&self) -> Connection {
+        self.connection.clone()
     }
 }
 
@@ -627,7 +645,7 @@ impl<TStrategy> ConnectionPool for StaticNodeListConnectionPool<TStrategy>
 where
     TStrategy: Strategy + Clone,
 {
-    fn next(&self) -> &Connection {
+    fn next(&self) -> Connection {
         self.strategy.try_next(&self.connections).unwrap()
     }
 }
@@ -649,7 +667,7 @@ impl StaticNodeListConnectionPool<RoundRobin> {
 /** The strategy selects an address from a given collection. */
 pub trait Strategy: Send + Sync + Debug {
     /** Try get the next connection. */
-    fn try_next<'a>(&self, connections: &'a [Connection]) -> Result<&'a Connection, Error>;
+    fn try_next<'a>(&self, connections: &'a [Connection]) -> Result<Connection, Error>;
 }
 
 /** A round-robin strategy cycles through nodes sequentially. */
@@ -667,13 +685,136 @@ impl Default for RoundRobin {
 }
 
 impl Strategy for RoundRobin {
-    fn try_next<'a>(&self, connections: &'a [Connection]) -> Result<&'a Connection, Error> {
+    fn try_next<'a>(&self, connections: &'a [Connection]) -> Result<Connection, Error> {
         if connections.is_empty() {
             Err(crate::error::lib("Connection list empty"))
         } else {
             let i = self.index.fetch_add(1, Ordering::Relaxed) % connections.len();
-            Ok(&connections[i])
+            Ok(connections[i].clone())
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SniffConnectionPool {
+    inner: Arc<RwLock<SniffConnectionPoolInner>>,
+}
+
+impl SniffConnectionPool {
+    fn round_robin(
+        transport: Transport,
+        wait: Duration,
+        nodes: StaticNodeListConnectionPool,
+    ) -> Self {
+        let inner = Arc::new(RwLock::new(SniffConnectionPoolInner {
+            transport,
+            last_update: None,
+            wait,
+            refreshing: false,
+            nodes,
+        }));
+
+        Self { inner }
+    }
+}
+
+impl ConnectionPool for SniffConnectionPool {
+    fn next(&self) -> Connection {
+        if let Some(connection) = self.next_or_start_refresh() {
+            return connection;
+        }
+
+        let mut inner = self.inner.write().expect("lock poisoned");
+        let scheme = inner.transport.conn_pool.next().url.scheme().to_string();
+        let nodes = futures::executor::block_on(inner.sniff_nodes(scheme)).unwrap();
+        inner.update_nodes_and_next(nodes)
+    }
+}
+
+impl SniffConnectionPool {
+    fn next_or_start_refresh(&self) -> Option<Connection> {
+        // Attempt to get an address using only a read lock first
+        let read_fresh = {
+            let inner = self.inner.read().expect("lock poisoned");
+
+            if !inner.should_refresh() {
+                // Return the next address without refreshing
+                let address = inner.nodes.next();
+
+                Some(address)
+            } else {
+                None
+            }
+        };
+
+        // Attempt to refresh using a write lock otherwise
+        read_fresh.or_else(|| {
+            let mut inner = self.inner.write().expect("lock poisoned");
+
+            if inner.refreshing {
+                // Return the next address without refreshing
+                // This is unlikely but it's possible that a write lock
+                // gets acquired after another thread kicks off a refresh.
+                // In that case we don't want to do another one.
+                let address = inner.nodes.next();
+
+                Some(address)
+            } else {
+                inner.refreshing = true;
+
+                None
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SniffConnectionPoolInner {
+    transport: Transport,
+    last_update: Option<Instant>,
+    wait: Duration,
+    refreshing: bool,
+    nodes: StaticNodeListConnectionPool,
+}
+
+impl SniffConnectionPoolInner {
+    async fn sniff_nodes(&mut self, scheme: String) -> Result<Vec<Connection>, Error> {
+        let response = NodesInfo::new(&self.transport, NodesInfoParts::None)
+            .send()
+            .await?;
+        let json_nodes: Value = response.json().await?;
+        let connections = json_nodes["nodes"]
+            .as_array()
+            .unwrap()
+            .into_iter()
+            .map(|node| {
+                let url = format!(
+                    "{}://{}",
+                    scheme,
+                    node["http"]["publish_address"].as_str().unwrap()
+                );
+                Connection::new(Url::parse(url.as_str()).unwrap())
+            })
+            .collect();
+        Ok(connections)
+    }
+
+    fn should_refresh(&self) -> bool {
+        // If there isn't a value for the last update then assume we need to refresh.
+        let last_update_is_stale = self
+            .last_update
+            .as_ref()
+            .map(|last_update| last_update.elapsed() > self.wait);
+
+        !self.refreshing && last_update_is_stale.unwrap_or(true)
+    }
+
+    fn update_nodes_and_next(&mut self, connections: Vec<Connection>) -> Connection {
+        self.refreshing = false;
+        self.last_update = Some(Instant::now());
+        self.nodes.connections = connections;
+        self.transport.conn_pool = std::boxed::Box::new(self.nodes.clone());
+        self.nodes.next()
     }
 }
 
